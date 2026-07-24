@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from logging import INFO
 
 from dotenv import load_dotenv
+from openai import APIConnectionError
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
@@ -222,6 +223,11 @@ async def main():
                     print(f'  {key}: {value}')
             print('---')
 
+    except APIConnectionError as e:
+        logger.error(
+            'Unable to reach the OpenAI API. Check outbound network/DNS access and OPENAI_API_KEY. '
+            f'Error: {e}'
+        )
     finally:
         #################################################
         # CLEANUP
