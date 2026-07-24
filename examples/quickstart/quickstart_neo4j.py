@@ -21,7 +21,16 @@ import os
 from datetime import datetime, timezone
 from logging import INFO
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
+
+# Load .env file from repository root BEFORE importing graphiti_core
+# Note: We use dotenv_values instead of load_dotenv because load_dotenv
+# doesn't always set environment variables properly in all contexts
+_env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.env'))
+_env_values = dotenv_values(dotenv_path=_env_path)
+for _key, _value in _env_values.items():
+    if _value:  # Only set if value is not empty
+        os.environ[_key] = _value
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
@@ -42,11 +51,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-
 # Neo4j connection parameters
 # Make sure Neo4j Desktop is running with a local DBMS started
-neo4j_uri = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+neo4j_uri = os.environ.get('NEO4J_URI', 'bolt://localhost:17687')
 neo4j_user = os.environ.get('NEO4J_USER', 'neo4j')
 neo4j_password = os.environ.get('NEO4J_PASSWORD', 'password')
 
