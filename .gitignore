@@ -169,3 +169,6 @@ cache.db*
 
 # Dev container configuration
 .devcontainer/
+
+# Claude Code local settings (personal/machine-specific permission grants)
+.claude/settings.local.json
