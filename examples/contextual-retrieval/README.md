@@ -1,10 +1,21 @@
 # Document Chunking with Contextualized Retrieval for Graphiti
 
 This is a port of Zep's [chunking-example](https://github.com/getzep/zep/tree/main/examples/python/chunking-example)
-to the Graphiti framework. It demonstrates Anthropic's **contextualized
-retrieval** technique: the document is chunked, OpenAI generates a short
-contextual description for each chunk, and the contextualized chunks are
-ingested into Graphiti as episodes.
+to the Graphiti framework. It demonstrates Anthropic's [**Contextual
+Retrieval**](https://www.anthropic.com/engineering/contextual-retrieval)
+technique: the document is chunked, an LLM generates a short contextual
+description for each chunk, and the contextualized chunks are ingested
+into Graphiti as episodes.
+
+By default this uses Claude with explicit prompt-cache breakpoints
+(`cache_control`), the mechanism the technique was designed around: the
+full document is cached once and re-read at a 90% discount for every
+chunk instead of being re-billed at full price per call. Pass `--provider
+openai` to use an OpenAI model instead -- it relies on OpenAI's automatic
+prompt caching (no explicit cache markers, ~50% discount), which works
+but wasn't the technique's original design point. Anthropic's own writeup
+reports this approach cuts retrieval failure rates by 35% (49% combined
+with BM25, 67% with reranking added) versus chunking without context.
 
 ## Why Contextualized Retrieval?
 
@@ -74,6 +85,10 @@ handing it to Graphiti at all.
 
 2. Set environment variables (or set them in the repo root `.env`):
    ```bash
+   # Required for the default provider (--provider anthropic)
+   export ANTHROPIC_API_KEY=your_anthropic_api_key
+
+   # Required only if using --provider openai
    export OPENAI_API_KEY=your_openai_api_key
 
    # Optional Neo4j connection parameters (defaults shown)
@@ -86,6 +101,12 @@ handing it to Graphiti at all.
 
 ```bash
 python chunk_and_ingest.py sample_document.txt --group-id acme-handbook
+```
+
+Use OpenAI instead of Anthropic for contextualization:
+
+```bash
+python chunk_and_ingest.py sample_document.txt --group-id acme-handbook --provider openai
 ```
 
 ### Dry run
@@ -102,6 +123,7 @@ python chunk_and_ingest.py sample_document.txt --group-id acme-handbook --dry-ru
 |--------|-------------|---------|
 | `document` | Path to the document to process | (required) |
 | `--group-id` | Graphiti `group_id` to scope this document's episodes into | (required) |
+| `--provider` | LLM used to contextualize chunks: `anthropic` or `openai` | `anthropic` |
 | `--dry-run` | Chunk and contextualize without ingesting into Graphiti | False |
 
 ## How It Works
@@ -109,9 +131,19 @@ python chunk_and_ingest.py sample_document.txt --group-id acme-handbook --dry-ru
 1. **Document Chunking**: paragraph-first, sentence fallback, with a
    50-character overlap between chunks (configured via the `CHUNK_SIZE`
    and `CHUNK_OVERLAP` constants at the top of the script).
-2. **Contextualization**: each chunk is sent to OpenAI's `gpt-5.4-mini`
-   along with the full document, which returns a short description
-   situating the chunk.
+2. **Contextualization**: each chunk is sent to an LLM along with the
+   full document, which returns a short description situating the
+   chunk.
+   - With `--provider anthropic` (default): the document is placed in
+     its own `cache_control`-marked content block. The first chunk is
+     sent alone to prime the cache (Anthropic's cache is only populated
+     once a request completes, so firing every chunk concurrently from
+     a cold cache would make them all pay the cache-write price), then
+     the remaining chunks are contextualized concurrently against the
+     now-warm cache, read at a 90% discount, with a 1-hour TTL.
+   - With `--provider openai`: the document and chunk are sent together
+     in one prompt, relying on OpenAI's automatic caching (~50%
+     discount) instead of an explicit cache breakpoint.
 3. **Ingestion**: the contextualized chunk (context + `---` separator +
    original chunk text) is added to Graphiti via `add_episode`, which
    extracts entities (nodes) and facts (edges) from it and merges them

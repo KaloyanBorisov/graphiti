@@ -20,14 +20,24 @@ Port of Zep's contextualized-retrieval example
 (https://github.com/getzep/zep/tree/main/examples/python/chunking-example)
 to the Graphiti framework.
 
-This script demonstrates Anthropic's contextualized retrieval technique:
+This script demonstrates Anthropic's Contextual Retrieval technique
+(https://www.anthropic.com/engineering/contextual-retrieval):
 1. Chunks a document into manageable pieces (paragraph-first, sentence
    fallback, with overlap for continuity).
-2. Uses OpenAI to generate a short "situating" context for each chunk,
+2. Uses an LLM to generate a short "situating" context for each chunk,
    based on the full document.
 3. Ingests each contextualized chunk into Graphiti as an episode via
    `add_episode`, scoped to a `group_id` (Graphiti's equivalent of a
    per-user/per-document graph namespace).
+
+Two contextualization providers are available via --provider:
+- anthropic (default): uses Claude with explicit prompt-cache breakpoints
+  (`cache_control`), the mechanism Anthropic's technique was designed
+  around. The document is cached once and re-read at a 90% discount for
+  every chunk, rather than re-billed at full price per call.
+- openai: uses an OpenAI model with automatic prompt caching (no explicit
+  cache markers, ~50% discount on cached tokens). Kept for comparison /
+  for users without an Anthropic key.
 
 Note: Graphiti already chunks dense episodes internally before entity
 extraction (see examples/quickstart/dense_vs_normal_ingestion.py). That
@@ -46,7 +56,6 @@ import re
 from datetime import datetime, timezone
 
 from dotenv import dotenv_values
-from openai import AsyncOpenAI
 
 # Load .env file from repository root BEFORE importing graphiti_core
 _env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.env'))
@@ -61,8 +70,19 @@ from graphiti_core.nodes import EpisodeType
 # Configuration
 CHUNK_SIZE = 500  # Characters per chunk
 CHUNK_OVERLAP = 50  # Overlap between chunks for continuity
+ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'
 OPENAI_MODEL = 'gpt-5.4-mini'
 MAX_CONCURRENCY = 5  # Concurrent contextualization calls in flight at once
+
+CONTEXT_INSTRUCTIONS = """Here is the chunk we want to situate within the whole document:
+<chunk>
+{chunk}
+</chunk>
+
+Please give a short succinct context to situate this chunk within the
+overall document for the purposes of improving search retrieval of the
+chunk. If the document has a publication date, please include the date
+in your context. Answer only with the succinct context and nothing else."""
 
 
 def split_into_sentences(text: str) -> list[str]:
@@ -135,8 +155,74 @@ def chunk_document(document: str) -> list[str]:
     return chunks
 
 
-async def contextualize_chunk(
-    openai_client: AsyncOpenAI,
+async def contextualize_chunk_anthropic(
+    anthropic_client,
+    semaphore: asyncio.Semaphore,
+    full_document: str,
+    chunk: str,
+) -> str:
+    """
+    Use Claude to situate a chunk within the document context.
+
+    This is Anthropic's Contextual Retrieval technique as published
+    (https://www.anthropic.com/engineering/contextual-retrieval): the
+    document is placed in its own content block with an explicit
+    `cache_control` breakpoint, so it is billed in full only on the
+    first call and re-read at a 90% discount for every subsequent
+    chunk that reuses the cache -- rather than re-billing the whole
+    document at full price per chunk. The chunk-specific instructions
+    go in a second, uncached block appended after it.
+
+    A 1-hour cache TTL is used since contextualizing every chunk of a
+    large document can take longer than the default 5-minute TTL.
+    """
+    max_retries = 3
+    retry_delay = 1
+
+    async with semaphore:
+        for attempt in range(max_retries):
+            try:
+                response = await anthropic_client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=256,
+                    messages=[
+                        {
+                            'role': 'user',
+                            'content': [
+                                {
+                                    'type': 'text',
+                                    'text': f'<document>\n{full_document}\n</document>',
+                                    'cache_control': {'type': 'ephemeral', 'ttl': '1h'},
+                                },
+                                {
+                                    'type': 'text',
+                                    'text': CONTEXT_INSTRUCTIONS.format(chunk=chunk),
+                                },
+                            ],
+                        }
+                    ],
+                )
+                usage = response.usage
+                created = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+                read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+                print(
+                    f'  [tokens] input={usage.input_tokens} cache_write={created} cache_read={read}'
+                )
+                context = response.content[0].text.strip()
+                return f'{context}\n\n---\n\n{chunk}'
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f'  Error contextualizing: {e}')
+                    print(f'  Retrying in {retry_delay}s...')
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise
+
+
+async def contextualize_chunk_openai(
+    openai_client,
     semaphore: asyncio.Semaphore,
     full_document: str,
     chunk: str,
@@ -145,32 +231,19 @@ async def contextualize_chunk(
     """
     Use OpenAI to situate a chunk within the document context.
 
-    This implements Anthropic's contextualized retrieval technique,
-    which improves search retrieval by adding contextual information
-    to each chunk before it is handed to Graphiti for entity/fact
-    extraction.
-
-    Every call resends the full document, so chunks are contextualized
-    concurrently (bounded by `semaphore`) rather than one at a time --
-    otherwise wall-clock time scales linearly with chunk count. The
-    document is placed first and the chunk last, per OpenAI's prompt
-    caching guidance (static content before variable content), and
-    `cache_key` keeps concurrent calls for the same document routed to
-    the same cache so they still hit it despite running in parallel.
+    Same idea as `contextualize_chunk_anthropic`, but relying on
+    OpenAI's automatic prompt caching (no explicit cache markers, ~50%
+    discount vs Anthropic's 90%). The document is placed first and the
+    chunk last, per OpenAI's prompt caching guidance (static content
+    before variable content), and `cache_key` keeps concurrent calls
+    for the same document routed to the same cache so they still hit
+    it despite running in parallel.
     """
     prompt = f"""<document>
 {full_document}
 </document>
 
-Here is the chunk we want to situate within the whole document:
-<chunk>
-{chunk}
-</chunk>
-
-Please give a short succinct context to situate this chunk within the
-overall document for the purposes of improving search retrieval of the
-chunk. If the document has a publication date, please include the date
-in your context. Answer only with the succinct context and nothing else."""
+{CONTEXT_INSTRUCTIONS.format(chunk=chunk)}"""
 
     max_retries = 3
     retry_delay = 1
@@ -216,18 +289,29 @@ async def ingest_to_graphiti(
     return result.episode.uuid
 
 
-async def process_document(document_path: str, group_id: str, dry_run: bool = False):
+async def process_document(
+    document_path: str, group_id: str, provider: str = 'anthropic', dry_run: bool = False
+):
     """
     Process a document through the full pipeline:
     1. Read and chunk the document
-    2. Contextualize each chunk using OpenAI
+    2. Contextualize each chunk using the chosen provider
     3. Ingest each contextualized chunk into Graphiti
     """
-    openai_api_key = os.environ.get('OPENAI_API_KEY')
-    if not openai_api_key:
-        raise ValueError('OPENAI_API_KEY environment variable not set')
+    if provider == 'anthropic':
+        from anthropic import AsyncAnthropic
 
-    openai_client = AsyncOpenAI(api_key=openai_api_key)
+        anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not anthropic_api_key:
+            raise ValueError('ANTHROPIC_API_KEY environment variable not set')
+        llm_client = AsyncAnthropic(api_key=anthropic_api_key)
+    else:
+        from openai import AsyncOpenAI
+
+        openai_api_key = os.environ.get('OPENAI_API_KEY')
+        if not openai_api_key:
+            raise ValueError('OPENAI_API_KEY environment variable not set')
+        llm_client = AsyncOpenAI(api_key=openai_api_key)
 
     graphiti = None
     if not dry_run:
@@ -253,16 +337,38 @@ async def process_document(document_path: str, group_id: str, dry_run: bool = Fa
 
         print(f'\nContextualizing {len(chunks)} chunks (up to {MAX_CONCURRENCY} concurrently)...')
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        # Stable per-document key so concurrent calls hit the same prompt
-        # cache instead of scattering across backend replicas.
-        cache_key = hashlib.sha256(document_content.encode()).hexdigest()[:32]
-        contextualized_results = await asyncio.gather(
-            *(
-                contextualize_chunk(openai_client, semaphore, document_content, chunk, cache_key)
-                for chunk in chunks
-            ),
-            return_exceptions=True,
-        )
+
+        if provider == 'anthropic':
+            # Anthropic's cache is only populated once a request completes,
+            # so firing every chunk concurrently from a cold cache would
+            # make them all pay the (more expensive) cache-write price.
+            # Run the first chunk alone to prime the cache, then fan the
+            # rest out concurrently against the now-warm cache.
+            print('  Priming prompt cache with first chunk...')
+            first_result = await contextualize_chunk_anthropic(
+                llm_client, semaphore, document_content, chunks[0]
+            )
+            rest_results = await asyncio.gather(
+                *(
+                    contextualize_chunk_anthropic(llm_client, semaphore, document_content, chunk)
+                    for chunk in chunks[1:]
+                ),
+                return_exceptions=True,
+            )
+            contextualized_results = [first_result, *rest_results]
+        else:
+            # Stable per-document key so concurrent calls hit the same
+            # prompt cache instead of scattering across backend replicas.
+            cache_key = hashlib.sha256(document_content.encode()).hexdigest()[:32]
+            contextualized_results = await asyncio.gather(
+                *(
+                    contextualize_chunk_openai(
+                        llm_client, semaphore, document_content, chunk, cache_key
+                    )
+                    for chunk in chunks
+                ),
+                return_exceptions=True,
+            )
 
         print('\nProcessing chunks:')
         print('-' * 60)
@@ -273,6 +379,7 @@ async def process_document(document_path: str, group_id: str, dry_run: bool = Fa
 
         for i, (chunk, contextualized) in enumerate(zip(chunks, contextualized_results)):
             print(f'\nChunk {i + 1}/{len(chunks)} ({len(chunk):,} chars)')
+            print(f'  Chunk: "{chunk}"')
 
             if isinstance(contextualized, BaseException):
                 print(f'  ERROR contextualizing: {contextualized}')
@@ -325,6 +432,14 @@ def main():
         help="Graphiti group_id to scope this document's episodes into (e.g. a user or doc id)",
     )
     parser.add_argument(
+        '--provider',
+        choices=['anthropic', 'openai'],
+        default='anthropic',
+        help="LLM used to contextualize chunks (default: anthropic, the technique's "
+        'origin -- uses explicit prompt caching for a 90%% discount on the repeated '
+        'document; openai is offered for comparison, with ~50%% automatic caching)',
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Chunk and contextualize without ingesting into Graphiti',
@@ -336,11 +451,12 @@ def main():
     print('=' * 60)
     print(f'Document: {args.document}')
     print(f'Group ID: {args.group_id}')
+    print(f'Provider: {args.provider}')
     print(f'Chunk size: {CHUNK_SIZE}')
     print(f'Chunk overlap: {CHUNK_OVERLAP}')
     print(f'Dry run: {args.dry_run}')
 
-    asyncio.run(process_document(args.document, args.group_id, args.dry_run))
+    asyncio.run(process_document(args.document, args.group_id, args.provider, args.dry_run))
 
 
 if __name__ == '__main__':
