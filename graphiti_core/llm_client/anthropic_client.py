@@ -31,12 +31,12 @@ from .errors import RateLimitError, RefusalError
 if TYPE_CHECKING:
     import anthropic
     from anthropic import AsyncAnthropic
-    from anthropic.types import MessageParam, ToolChoiceParam, ToolUnionParam
+    from anthropic.types import MessageParam, TextBlockParam, ToolChoiceParam, ToolUnionParam
 else:
     try:
         import anthropic
         from anthropic import AsyncAnthropic
-        from anthropic.types import MessageParam, ToolChoiceParam, ToolUnionParam
+        from anthropic.types import MessageParam, TextBlockParam, ToolChoiceParam, ToolUnionParam
     except ImportError:
         raise ImportError(
             'anthropic is required for AnthropicClient. '
@@ -47,9 +47,10 @@ else:
 logger = logging.getLogger(__name__)
 
 AnthropicModel = Literal[
-    'claude-sonnet-4-5-latest',
+    'claude-sonnet-4-5',
     'claude-sonnet-4-5-20250929',
-    'claude-haiku-4-5-latest',
+    'claude-haiku-4-5',
+    'claude-haiku-4-5-20251001',
     'claude-3-7-sonnet-latest',
     'claude-3-7-sonnet-20250219',
     'claude-3-5-haiku-latest',
@@ -65,7 +66,7 @@ AnthropicModel = Literal[
     'claude-2.0',
 ]
 
-DEFAULT_MODEL: AnthropicModel = 'claude-haiku-4-5-latest'
+DEFAULT_MODEL: AnthropicModel = 'claude-haiku-4-5'
 
 # Maximum output tokens for different Anthropic models
 # Based on official Anthropic documentation (as of 2025)
@@ -74,9 +75,10 @@ DEFAULT_MODEL: AnthropicModel = 'claude-haiku-4-5-latest'
 # 128K with 'anthropic-beta: output-128k-2025-02-19' header, but this is not currently implemented).
 ANTHROPIC_MODEL_MAX_TOKENS = {
     # Claude 4.5 models - 64K tokens
-    'claude-sonnet-4-5-latest': 65536,
+    'claude-sonnet-4-5': 65536,
     'claude-sonnet-4-5-20250929': 65536,
-    'claude-haiku-4-5-latest': 65536,
+    'claude-haiku-4-5': 65536,
+    'claude-haiku-4-5-20251001': 65536,
     # Claude 3.7 models - standard 64K tokens
     'claude-3-7-sonnet-latest': 65536,
     'claude-3-7-sonnet-20250219': 65536,
@@ -109,6 +111,10 @@ class AnthropicClient(LLMClient):
         cache: Whether to cache the LLM responses.
         client: An optional client instance to use.
         max_tokens: The maximum number of tokens to generate.
+        enable_prompt_caching: Whether to mark the system prompt with an Anthropic
+            ephemeral cache_control breakpoint, so repeated calls that share the same
+            system prompt (e.g. entity extraction, deduplication) are billed at the
+            cheaper cache-read rate instead of full price. Defaults to True.
 
     Methods:
         generate_response: Generate a response from the LLM.
@@ -127,6 +133,7 @@ class AnthropicClient(LLMClient):
         cache: bool = False,
         client: AsyncAnthropic | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        enable_prompt_caching: bool = True,
     ) -> None:
         if config is None:
             config = LLMConfig()
@@ -139,6 +146,7 @@ class AnthropicClient(LLMClient):
         super().__init__(config, cache)
         # Explicitly set the instance model to the config model to prevent type checking errors
         self.model = typing.cast(AnthropicModel, config.model)
+        self.enable_prompt_caching = enable_prompt_caching
 
         if not client:
             self.client = AsyncAnthropic(
@@ -282,11 +290,26 @@ class AnthropicClient(LLMClient):
         # This allows different models to use their full output capacity
         max_creation_tokens: int = self._resolve_max_tokens(max_tokens, self.model)
 
+        # Mark the system prompt as cacheable so repeated calls that share it (e.g. the
+        # same extraction/dedupe prompt across many episodes) are billed at the cheaper
+        # cache-read rate. Prompts below Anthropic's per-model minimum simply won't cache.
+        system_param: str | list[TextBlockParam]
+        if self.enable_prompt_caching:
+            system_param = [
+                {
+                    'type': 'text',
+                    'text': system_message.content,
+                    'cache_control': {'type': 'ephemeral'},
+                }
+            ]
+        else:
+            system_param = system_message.content
+
         try:
             # Create the appropriate tool based on whether response_model is provided
             tools, tool_choice = self._create_tool(response_model)
             result = await self.client.messages.create(
-                system=system_message.content,
+                system=system_param,
                 max_tokens=max_creation_tokens,
                 temperature=self.temperature,
                 messages=user_messages_cast,

@@ -81,7 +81,7 @@ class TestAnthropicClientInitialization:
         config = LLMConfig(api_key='test_api_key')
         client = AnthropicClient(config=config, cache=False)
 
-        assert client.model == 'claude-haiku-4-5-latest'
+        assert client.model == 'claude-haiku-4-5'
 
     @patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'env_api_key'})
     def test_init_without_config(self):
@@ -89,7 +89,7 @@ class TestAnthropicClientInitialization:
         client = AnthropicClient(cache=False)
 
         assert client.config.api_key == 'env_api_key'
-        assert client.model == 'claude-haiku-4-5-latest'
+        assert client.model == 'claude-haiku-4-5'
 
     def test_init_with_custom_client(self):
         """Test initialization with a custom AsyncAnthropic client."""
@@ -220,6 +220,59 @@ class TestAnthropicClientGenerateResponse:
         tools, tool_choice = anthropic_client._create_tool()
         assert len(tools) == 1
         assert tools[0]['name'] == 'generic_json_output'
+
+    @pytest.mark.asyncio
+    async def test_prompt_caching_enabled_by_default(self, anthropic_client, mock_async_anthropic):
+        """System prompt should get an ephemeral cache_control breakpoint by default."""
+        content_item = MagicMock()
+        content_item.type = 'tool_use'
+        content_item.input = {'test_field': 'test_value'}
+
+        mock_response = MagicMock()
+        mock_response.content = [content_item]
+        mock_async_anthropic.messages.create.return_value = mock_response
+
+        messages = [
+            Message(role='system', content='System message'),
+            Message(role='user', content='User message'),
+        ]
+        await anthropic_client.generate_response(messages=messages, response_model=ResponseModel)
+
+        _, kwargs = mock_async_anthropic.messages.create.call_args
+        assert kwargs['system'] == [
+            {
+                'type': 'text',
+                'text': 'System message',
+                'cache_control': {'type': 'ephemeral'},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prompt_caching_disabled(self, mock_async_anthropic):
+        """When disabled, the system prompt should be sent as a plain string."""
+        with patch('anthropic.AsyncAnthropic', return_value=mock_async_anthropic):
+            config = LLMConfig(
+                api_key='test_api_key', model='test-model', temperature=0.5, max_tokens=1000
+            )
+            client = AnthropicClient(config=config, cache=False, enable_prompt_caching=False)
+            client.client = mock_async_anthropic
+
+        content_item = MagicMock()
+        content_item.type = 'tool_use'
+        content_item.input = {'test_field': 'test_value'}
+
+        mock_response = MagicMock()
+        mock_response.content = [content_item]
+        mock_async_anthropic.messages.create.return_value = mock_response
+
+        messages = [
+            Message(role='system', content='System message'),
+            Message(role='user', content='User message'),
+        ]
+        await client.generate_response(messages=messages, response_model=ResponseModel)
+
+        _, kwargs = mock_async_anthropic.messages.create.call_args
+        assert kwargs['system'] == 'System message'
 
     @pytest.mark.asyncio
     async def test_validation_error_retry(self, anthropic_client, mock_async_anthropic):

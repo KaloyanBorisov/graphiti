@@ -149,9 +149,9 @@ The codebase supports multiple LLM providers but works best with services suppor
 
 **Anthropic Models:**
 - **Claude 4.5 Family** (Latest):
-  - `claude-sonnet-4-5-latest` - Flagship model, auto-updates
+  - `claude-sonnet-4-5` - Flagship model, auto-updates
   - `claude-sonnet-4-5-20250929` - Pinned Sonnet version from September 2025
-  - `claude-haiku-4-5-latest` - Fast model, auto-updates
+  - `claude-haiku-4-5` - Fast model, auto-updates
 - **Claude 3.7 Family**:
   - `claude-3-7-sonnet-latest` - Auto-updates
   - `claude-3-7-sonnet-20250219` - Pinned version from February 2025
