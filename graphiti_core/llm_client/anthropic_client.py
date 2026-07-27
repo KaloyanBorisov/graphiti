@@ -66,8 +66,6 @@ AnthropicModel = Literal[
     'claude-2.0',
 ]
 
-DEFAULT_MODEL: AnthropicModel = 'claude-haiku-4-5'
-
 # Maximum output tokens for different Anthropic models
 # Based on official Anthropic documentation (as of 2025)
 # Note: These represent standard limits without beta headers.
@@ -122,6 +120,9 @@ class AnthropicClient(LLMClient):
     Notes:
         - If a LLMConfig is not provided, api_key will be pulled from the ANTHROPIC_API_KEY environment
             variable, and all default values will be used for the LLMConfig.
+        - There is no hardcoded default model. A model must be provided either via
+            config.model or the ANTHROPIC_MODEL environment variable; otherwise a
+            ValueError is raised.
 
     """
 
@@ -141,7 +142,13 @@ class AnthropicClient(LLMClient):
             config.max_tokens = max_tokens
 
         if config.model is None:
-            config.model = DEFAULT_MODEL
+            config.model = os.getenv('ANTHROPIC_MODEL')
+
+        if config.model is None:
+            raise ValueError(
+                'No Anthropic model specified. Set config.model or the ANTHROPIC_MODEL '
+                'environment variable.'
+            )
 
         super().__init__(config, cache)
         # Explicitly set the instance model to the config model to prevent type checking errors

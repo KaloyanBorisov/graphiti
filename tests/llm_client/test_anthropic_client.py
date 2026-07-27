@@ -76,25 +76,46 @@ class TestAnthropicClientInitialization:
         assert client.temperature == 0.5
         assert client.max_tokens == 1000
 
-    def test_init_with_default_model(self):
-        """Test initialization with default model when none is provided."""
+    @patch.dict(os.environ, {}, clear=False)
+    def test_init_without_model_raises(self):
+        """There is no hardcoded default model; omitting it everywhere should raise."""
+        os.environ.pop('ANTHROPIC_MODEL', None)
         config = LLMConfig(api_key='test_api_key')
-        client = AnthropicClient(config=config, cache=False)
 
-        assert client.model == 'claude-haiku-4-5'
+        with pytest.raises(ValueError, match='No Anthropic model specified'):
+            AnthropicClient(config=config, cache=False)
 
-    @patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'env_api_key'})
+    @patch.dict(
+        os.environ, {'ANTHROPIC_API_KEY': 'env_api_key', 'ANTHROPIC_MODEL': 'claude-haiku-4-5'}
+    )
     def test_init_without_config(self):
-        """Test initialization without a config, using environment variable."""
+        """Test initialization without a config, using environment variables."""
         client = AnthropicClient(cache=False)
 
         assert client.config.api_key == 'env_api_key'
         assert client.model == 'claude-haiku-4-5'
 
+    @patch.dict(os.environ, {'ANTHROPIC_MODEL': 'claude-sonnet-4-5'})
+    def test_init_with_model_env_var(self):
+        """Test that ANTHROPIC_MODEL overrides the hardcoded default when no model is set."""
+        config = LLMConfig(api_key='test_api_key')
+        client = AnthropicClient(config=config, cache=False)
+
+        assert client.model == 'claude-sonnet-4-5'
+
+    def test_init_with_config_model_takes_precedence_over_env_var(self):
+        """An explicit config.model should win over ANTHROPIC_MODEL."""
+        with patch.dict(os.environ, {'ANTHROPIC_MODEL': 'claude-sonnet-4-5'}):
+            config = LLMConfig(api_key='test_api_key', model='claude-3-5-haiku-latest')
+            client = AnthropicClient(config=config, cache=False)
+
+        assert client.model == 'claude-3-5-haiku-latest'
+
     def test_init_with_custom_client(self):
         """Test initialization with a custom AsyncAnthropic client."""
         mock_client = MagicMock()
-        client = AnthropicClient(client=mock_client)
+        config = LLMConfig(api_key='test_api_key', model='test-model')
+        client = AnthropicClient(config=config, client=mock_client)
 
         assert client.client == mock_client
 

@@ -22,6 +22,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
+from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.prompts.models import Message
 
 # Skip all tests if no API key is available
@@ -45,7 +46,7 @@ async def test_generate_simple_response():
     if 'TEST_ANTHROPIC_API_KEY' not in os.environ:
         pytest.skip('Anthropic API key not available')
 
-    client = AnthropicClient()
+    client = AnthropicClient(config=LLMConfig(model='claude-haiku-4-5'))
 
     messages = [
         Message(
@@ -73,6 +74,7 @@ async def test_extract_json_from_text():
     with pytest.MonkeyPatch.context() as monkeypatch:
         # Temporarily set an environment variable to avoid API key error
         monkeypatch.setenv('ANTHROPIC_API_KEY', 'fake_key_for_testing')
+        monkeypatch.setenv('ANTHROPIC_MODEL', 'claude-haiku-4-5')
         client = AnthropicClient(cache=False)
 
     # A string with embedded JSON
