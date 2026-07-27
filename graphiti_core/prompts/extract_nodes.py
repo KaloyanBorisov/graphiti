@@ -81,12 +81,14 @@ class Versions(TypedDict):
 
 
 def extract_message(context: dict[str, Any]) -> list[Message]:
+    # This instructional content is identical on every call (no per-episode data), so it lives
+    # in the system prompt where AnthropicClient marks it cacheable — keeping it here (rather
+    # than in the user prompt) lets repeated extraction calls hit Anthropic's prompt cache.
     sys_prompt = (
         'You are an entity extraction specialist for conversational messages. '
         'NEVER extract abstract concepts, feelings, or generic words.'
-    )
+    ) + """
 
-    user_prompt = f"""
 NEVER extract any of the following:
 - Pronouns (you, me, I, he, she, they, we, us, it, them, him, her, this, that, those)
 - Abstract concepts or feelings (joy, balance, growth, resilience, happiness, passion, motivation)
@@ -114,18 +116,6 @@ NEVER extract any of the following:
 Your task is to extract **entity nodes** that are **explicitly** mentioned in the CURRENT MESSAGE.
 Pronoun references such as he/she/they or this/that/those should be disambiguated to the names of the
 reference entities. Only extract distinct entities from the CURRENT MESSAGE.
-
-<ENTITY TYPES>
-{context['entity_types']}
-</ENTITY TYPES>
-
-<PREVIOUS MESSAGES>
-{to_prompt_json([ep for ep in context['previous_episodes']])}
-</PREVIOUS MESSAGES>
-
-<CURRENT MESSAGE>
-{context['episode_content']}
-</CURRENT MESSAGE>
 
 1. **Speaker Extraction**: Always extract the speaker (the part before the colon `:` in each dialogue line) as the first entity node.
    - If the speaker is mentioned again in the message, treat both mentions as a **single entity**.
@@ -200,7 +190,20 @@ Do NOT extract: "pic" (generic media noun), "game" (generic event noun), "event"
 Message: "Jordan: We won by a tight score. Scoring that last basket felt incredible."
 Good extractions: "Jordan" (speaker)
 Do NOT extract: "basket" (ambiguous bare noun that depends on sentence context)
-</EXAMPLE>
+</EXAMPLE>"""
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<PREVIOUS MESSAGES>
+{to_prompt_json([ep for ep in context['previous_episodes']])}
+</PREVIOUS MESSAGES>
+
+<CURRENT MESSAGE>
+{context['episode_content']}
+</CURRENT MESSAGE>
 
 {context['custom_extraction_instructions']}
 """
@@ -211,12 +214,13 @@ Do NOT extract: "basket" (ambiguous bare noun that depends on sentence context)
 
 
 def extract_json(context: dict[str, Any]) -> list[Message]:
+    # Static across every call (no per-episode data) — kept in the system prompt so it's long
+    # enough to clear Anthropic's cacheable-prefix minimum and repeated calls hit the cache.
     sys_prompt = (
         'You are an entity extraction specialist for JSON data. '
         'NEVER extract abstract concepts, dates, or generic field values.'
-    )
+    ) + """
 
-    user_prompt = f"""
 NEVER extract:
 - Date, time, or timestamp values
 - Abstract concepts or generic field values (e.g., "true", "active", "pending")
@@ -235,6 +239,55 @@ NEVER extract:
 
 Extract entities from the JSON and classify each using the ENTITY TYPES above.
 
+Guidelines:
+1. Extract the primary entity the JSON represents (e.g., a "name" or "user" field).
+2. Extract named entities referenced in other properties throughout the JSON structure.
+3. Only extract entities specific enough to be uniquely identifiable.
+4. Be explicit in naming entities — use full names when available.
+5. Use the most specific form present in the data (e.g., "road cycling" not "cycling").
+6. If a value would not be meaningful and distinguishable when read alone later, do NOT extract it.
+
+<EXAMPLE>
+JSON: {"user": "Jordan Lee", "company": "Acme Corp", "role": "engineer", "start_date": "2024-01-15", "location": "Denver", "active": true}
+Good extractions: "Jordan Lee" (Person), "Acme Corp" (Organization), "Denver" (Location)
+Do NOT extract: "engineer" (role, not an entity), "2024-01-15" (date), "true" (field value)
+</EXAMPLE>
+
+<EXAMPLE>
+JSON: {"author": "Alex", "attachment_type": "photo", "event_name": "event", "agency": "government"}
+Good extractions: "Alex" (Person)
+Do NOT extract: "photo" (generic media noun), "event" (generic event noun), "government" (broad institutional noun)
+</EXAMPLE>
+
+<EXAMPLE>
+JSON: {"order": {"item": "wool coat", "brand": "Patagonia"}, "customer": "Priya Shah", "shipping_address": {"city": "Austin"}}
+Good extractions: "Priya Shah" (Person), "Patagonia wool coat" (Object), "Austin" (Location)
+Do NOT extract: "shipping_address" (schema key, not a value), "item" / "brand" / "city" (schema keys), "wool coat" alone
+  (use the more specific brand-qualified "Patagonia wool coat" instead)
+</EXAMPLE>
+
+<EXAMPLE>
+JSON: {"customer": "Mateo Rivera", "notes": "Ordered as a gift for his sister", "sku": "MB-2291", "quantity": 2}
+Good extractions: "Mateo Rivera" (Person), "Mateo Rivera's sister" (Person)
+Do NOT extract: "sister" (bare relational term — qualify with the possessor as "Mateo Rivera's sister"),
+  "MB-2291" (numeric/product code, not a meaningful entity name), "quantity" / "2" (field value, not an entity)
+</EXAMPLE>
+
+<EXAMPLE>
+JSON: {"vehicle": {"make": "Ford", "model": "Mustang", "condition": "windshield cracked"}, "owner": "Elena Cho"}
+Good extractions: "Elena Cho" (Person), "Ford Mustang" (Object), "cracked windshield" (Object)
+Do NOT extract: "condition" (schema key, not a value), "windshield" alone (bare head noun — use "cracked windshield"),
+  "make" / "model" (schema keys)
+</EXAMPLE>
+
+<EXAMPLE>
+JSON: {"attendee": "Sam Okafor", "venue": {"name": "Riverside Convention Center"}, "session_type": "workshop", "organizer": "city government"}
+Good extractions: "Sam Okafor" (Person), "Riverside Convention Center" (Location)
+Do NOT extract: "workshop" (generic event/activity noun, not uniquely identified), "city government" (broad
+  institutional noun unless uniquely named), "session_type" / "organizer" (schema keys)
+</EXAMPLE>"""
+
+    user_prompt = f"""
 <ENTITY TYPES>
 {context['entity_types']}
 </ENTITY TYPES>
@@ -247,27 +300,7 @@ Extract entities from the JSON and classify each using the ENTITY TYPES above.
 {context['episode_content']}
 </JSON>
 
-Guidelines:
-1. Extract the primary entity the JSON represents (e.g., a "name" or "user" field).
-2. Extract named entities referenced in other properties throughout the JSON structure.
-3. Only extract entities specific enough to be uniquely identifiable.
-4. Be explicit in naming entities — use full names when available.
-5. Use the most specific form present in the data (e.g., "road cycling" not "cycling").
-6. If a value would not be meaningful and distinguishable when read alone later, do NOT extract it.
-
 {context['custom_extraction_instructions']}
-
-<EXAMPLE>
-JSON: {{"user": "Jordan Lee", "company": "Acme Corp", "role": "engineer", "start_date": "2024-01-15", "location": "Denver", "active": true}}
-Good extractions: "Jordan Lee" (Person), "Acme Corp" (Organization), "Denver" (Location)
-Do NOT extract: "engineer" (role, not an entity), "2024-01-15" (date), "true" (field value)
-</EXAMPLE>
-
-<EXAMPLE>
-JSON: {{"author": "Alex", "attachment_type": "photo", "event_name": "event", "agency": "government"}}
-Good extractions: "Alex" (Person)
-Do NOT extract: "photo" (generic media noun), "event" (generic event noun), "government" (broad institutional noun)
-</EXAMPLE>
 """
     return [
         Message(role='system', content=sys_prompt),

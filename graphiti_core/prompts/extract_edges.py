@@ -100,34 +100,17 @@ def edge(context: dict[str, Any]) -> list[Message]:
 </FACT_TYPES>
 """
 
-    return [
-        Message(
-            role='system',
-            content='You are an expert fact extractor that extracts fact triples from text. '
-            '1. Extracted fact triples should also be extracted with relevant date information. '
-            '2. The CURRENT_MESSAGE may contain multiple episodes, each with its own timestamp. '
-            "Use each episode's timestamp to resolve temporal references within that episode. "
-            'REFERENCE_TIME is a fallback for when no per-episode timestamp is available.',
-        ),
-        Message(
-            role='user',
-            content=f"""
-<PREVIOUS_MESSAGES>
-{to_prompt_json(context['previous_episodes'])}
-</PREVIOUS_MESSAGES>
+    # Everything below is identical on every call (no per-episode data), so it lives in the
+    # system prompt where AnthropicClient marks it cacheable — keeping it here (rather than in
+    # the user prompt) lets repeated extraction calls hit Anthropic's prompt cache.
+    sys_prompt = (
+        'You are an expert fact extractor that extracts fact triples from text. '
+        '1. Extracted fact triples should also be extracted with relevant date information. '
+        '2. The CURRENT_MESSAGE may contain multiple episodes, each with its own timestamp. '
+        "Use each episode's timestamp to resolve temporal references within that episode. "
+        'REFERENCE_TIME is a fallback for when no per-episode timestamp is available.'
+    ) + """
 
-<CURRENT_MESSAGE>
-{context['episode_content']}
-</CURRENT_MESSAGE>
-
-<ENTITIES>
-{to_prompt_json(context['nodes'])}
-</ENTITIES>
-
-<REFERENCE_TIME>
-{context['reference_time']}  # ISO 8601 (UTC); used to resolve relative time mentions
-</REFERENCE_TIME>
-{edge_types_section}
 # TASK
 Extract all factual relationships between the given ENTITIES based on the CURRENT MESSAGE.
 Only extract facts that:
@@ -137,9 +120,6 @@ Only extract facts that:
 - Facts should include entity names rather than pronouns whenever possible.
 
 You may use information from the PREVIOUS MESSAGES only to disambiguate references or support continuity.
-
-
-{context['custom_extraction_instructions']}
 
 # EXTRACTION RULES
 
@@ -172,8 +152,31 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 - If a change/termination is expressed, set `invalid_at` to the relevant timestamp.
 - Leave both fields `null` if no explicit or resolvable time is stated.
 - If only a date is mentioned (no time), assume 00:00:00.
-- If only a year is mentioned, use January 1st at 00:00:00.
-        """,
+- If only a year is mentioned, use January 1st at 00:00:00."""
+
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(
+            role='user',
+            content=f"""
+<PREVIOUS_MESSAGES>
+{to_prompt_json(context['previous_episodes'])}
+</PREVIOUS_MESSAGES>
+
+<CURRENT_MESSAGE>
+{context['episode_content']}
+</CURRENT_MESSAGE>
+
+<ENTITIES>
+{to_prompt_json(context['nodes'])}
+</ENTITIES>
+
+<REFERENCE_TIME>
+{context['reference_time']}  # ISO 8601 (UTC); used to resolve relative time mentions
+</REFERENCE_TIME>
+{edge_types_section}
+{context['custom_extraction_instructions']}
+""",
         ),
     ]
 
