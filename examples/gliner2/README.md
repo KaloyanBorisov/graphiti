@@ -32,6 +32,16 @@ The two extraction steps in more detail:
 
 **Why split the work this way:** finding entities is a narrow, repetitive task — a small local model handles it well and for free. Figuring out relationships and reasoning about time, duplicates, and phrasing takes real language understanding — that's worth paying for a capable model to do.
 
+## How Deduplication Works
+
+This example deliberately repeats the same handful of entities (Kamala Harris, Gavin Newsom, California, San Francisco) across languages and formats, to show off how Graphiti avoids creating duplicate nodes and facts every time an episode mentions something it already knows about. It works in escalating, increasingly expensive steps — cheap checks first, an LLM call only when there's real ambiguity to resolve:
+
+**Entities.** When GLiNER2 pulls a new entity out of an episode, Graphiti doesn't just add it — it first searches for existing nodes with a similar *name embedding*, scoped to the same dataset. If a candidate has the exact same name (after normalizing case/punctuation), it's merged immediately, no LLM involved. If names are close-but-not-identical, a fast fuzzy-matching check (comparing text shingles) can also merge them for free. Only when neither check is confident — for example, "Harris" in a Spanish sentence next to an English "Kamala Harris" node, where the strings genuinely don't match — does Graphiti ask Gemini to make the call.
+
+**Facts.** New facts go through the same idea: Graphiti gathers existing facts between the same two entities as duplicate candidates, plus a broader search for facts that might be *related* (not necessarily identical). An exact text match reuses the existing fact instantly. Otherwise, Gemini looks at both candidate sets and decides whether the new fact is a duplicate, a genuinely new fact, or a contradiction of an old one.
+
+**Contradictions and time.** This last case is where the bi-temporal model shows up: if a new fact contradicts an older one (e.g., a later episode says someone left a position they were previously said to hold), Graphiti doesn't delete the old fact — it marks it invalid as of the new fact's timestamp, so the graph still remembers it was true for a while. This is exactly how "Attorney General from 2011 to 2017" ends up as a fact with an actual validity window instead of a permanent, undated claim.
+
 ## Prerequisites
 
 - Python 3.11+
