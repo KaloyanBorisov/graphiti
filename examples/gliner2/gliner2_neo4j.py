@@ -14,22 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
-import json
+import asyncio  # Drives the async main() entrypoint
+import json  # Serializes the JSON episode's dict content to a string body
 import logging
-import os
-from datetime import datetime, timezone
+import os  # Reads connection/config values from environment variables
+from datetime import datetime, timezone  # Stamps each episode with its reference time
 from logging import INFO
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # Loads NEO4J_*/GOOGLE_API_KEY from a local .env file
 from pydantic import BaseModel, Field
 
-from graphiti_core import Graphiti
+from graphiti_core import Graphiti  # Main orchestrator: episodes, extraction, storage, search
 from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.gemini_client import GeminiClient
 from graphiti_core.llm_client.gliner2_client import GLiNER2Client
-from graphiti_core.nodes import EpisodeType
+from graphiti_core.nodes import EpisodeType  # Distinguishes plain-text vs. JSON episode bodies
 
 #################################################
 # CUSTOM ENTITY TYPES
@@ -45,6 +45,8 @@ from graphiti_core.nodes import EpisodeType
 class Person(BaseModel):
     """A human person, real or fictional."""
 
+    # Optional attributes below are filled in by the Gemini client (not GLiNER2),
+    # which reasons over the episode text once GLiNER2 has located the entity.
     occupation: str | None = Field(None, description='Professional role or job title')
     political_party: str | None = Field(None, description='Political party affiliation')
 
@@ -71,6 +73,8 @@ class Initiative(BaseModel):
     description: str | None = Field(None, description='Brief description of the initiative')
 
 
+# Maps label name -> Pydantic schema. Passed to add_episode() so GLiNER2 knows
+# which labels to look for and the Gemini client knows which attributes to extract.
 entity_types: dict[str, type[BaseModel]] = {
     'Person': Person,
     'Organization': Organization,
@@ -103,10 +107,12 @@ neo4j_uri = os.environ.get('NEO4J_URI')
 neo4j_user = os.environ.get('NEO4J_USER')
 neo4j_password = os.environ.get('NEO4J_PASSWORD')
 
+# Fail fast rather than letting Graphiti/the driver raise a less obvious error later
 if not neo4j_uri or not neo4j_user or not neo4j_password:
     raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
 
 # GLiNER2 model configuration
+# Any Hugging Face GLiNER2 checkpoint id works here; larger models trade CPU latency for accuracy
 gliner2_model = os.environ.get('GLINER2_MODEL', 'fastino/gliner2-large-v1')
 
 
@@ -120,23 +126,26 @@ async def main():
     # extraction, deduplication, and summarization.
     #################################################
 
-    # Create the Gemini client for reasoning tasks
+    # Create the Gemini client for reasoning tasks (edges, dedup, summarization,
+    # attribute extraction) — everything GLiNER2 itself can't do.
     gemini_client = GeminiClient(
         config=LLMConfig(
             api_key=os.environ.get('GOOGLE_API_KEY'),
-            model='gemini-2.5-flash-lite',
-            small_model='gemini-2.5-flash-lite',
+            model='gemini-2.5-flash',
+            small_model='gemini-2.5-flash',
         ),
     )
 
-    # Create the GLiNER2 hybrid client
+    # Create the GLiNER2 hybrid client. It performs entity/NER extraction locally
+    # on CPU and delegates every other LLM operation to the wrapped gemini_client.
+    # `threshold` is the minimum confidence score (0-1) for a span to be kept.
     gliner2_client = GLiNER2Client(
         config=LLMConfig(model=gliner2_model),
         llm_client=gemini_client,
         threshold=0.7,
     )
 
-    # Create the Gemini embedder
+    # Create the Gemini embedder, used to embed node/edge text for semantic search
     gemini_embedder = GeminiEmbedder(
         config=GeminiEmbedderConfig(
             api_key=os.environ.get('GOOGLE_API_KEY'),
@@ -144,7 +153,9 @@ async def main():
         ),
     )
 
-    # Initialize Graphiti with the GLiNER2 hybrid client and Gemini embedder
+    # Initialize Graphiti with the GLiNER2 hybrid client and Gemini embedder.
+    # This opens the Neo4j driver connection; indices/constraints are assumed
+    # to already exist (build_indices_and_constraints() is not called here).
     graphiti = Graphiti(
         neo4j_uri,
         neo4j_user,
@@ -164,6 +175,11 @@ async def main():
         # to OpenAI.
         #################################################
 
+        # Six episodes about the same handful of real-world entities (Kamala Harris,
+        # Gavin Newsom, California, San Francisco) written in different languages and
+        # formats. This exercises cross-episode entity resolution/deduplication —
+        # Graphiti should recognize "Kamala Harris" and "Harris" across English,
+        # Spanish, French, and a structured JSON payload as the same node.
         episodes = [
             # English: detailed political biography
             {
@@ -248,6 +264,11 @@ async def main():
         ]
 
         for i, episode in enumerate(episodes):
+            # add_episode() runs the full pipeline for one episode: GLiNER2 extracts
+            # entities matching entity_types, Gemini extracts edges/facts between
+            # them, resolves duplicates against existing graph nodes, and persists
+            # everything to Neo4j. JSON content is serialized to a string body since
+            # add_episode() expects text; `source` tells it how to parse that text.
             result = await graphiti.add_episode(
                 name=f'California Politics {i}',
                 episode_body=(
@@ -263,6 +284,7 @@ async def main():
 
             print(f'\n--- Episode: California Politics {i} ({episode["type"].value}) ---')
 
+            # Nodes created or resolved (matched to an existing entity) by this episode
             if result.nodes:
                 print(f'  Entities ({len(result.nodes)}):')
                 for node in result.nodes:
@@ -273,6 +295,8 @@ async def main():
                     if node.attributes:
                         print(f'      Attributes: {node.attributes}')
 
+            # Edges (facts) extracted between those nodes, with bi-temporal validity
+            # (valid_at/invalid_at) inferred from the episode text where possible
             if result.edges:
                 print(f'  Edges ({len(result.edges)}):')
                 for edge in result.edges:
@@ -287,6 +311,9 @@ async def main():
         # SEARCH
         #################################################
 
+        # Natural-language queries answered via Graphiti's hybrid search (semantic
+        # embedding similarity + BM25 keyword search + graph traversal), which
+        # returns ranked facts (edges) rather than raw entities.
         queries = [
             'Who was the California Attorney General?',
             'What banks were involved in the mortgage settlement?',
@@ -310,6 +337,9 @@ async def main():
         # ENTITY EXTRACTION LATENCY
         #################################################
 
+        # GLiNER2Client records wall-clock time for each local extraction call
+        # (populated in gliner2_client.py) — useful for comparing local NER speed
+        # against making an equivalent LLM API call for extraction.
         latencies = gliner2_client.extraction_latencies
         if latencies:
             print(f'\nGLiNER2 entity extraction latency ({len(latencies)} calls):')
@@ -319,6 +349,8 @@ async def main():
             print(f'  Total: {sum(latencies):.1f} ms')
 
     finally:
+        # Always close the Neo4j driver connection, even if an episode/search call
+        # raises above.
         await graphiti.close()
         print('\nConnection closed')
 
