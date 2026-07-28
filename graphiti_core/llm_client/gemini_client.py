@@ -290,6 +290,20 @@ class GeminiClient(LLMClient):
             resolved_max_tokens = self._resolve_max_tokens(max_tokens, model)
 
             # Create generation config
+            # Gemini 2.5 models apply implicit context caching automatically (no API call
+            # or flag needed, unlike AnthropicClient's explicit cache_control breakpoint):
+            # a request's static leading content is cached and billed at a reduced rate
+            # when a later request repeats the same prefix. system_instruction carries
+            # only the static prompt template + response schema (constant per prompt_name
+            # across every call), while the per-episode variable content lives in
+            # `contents`/gemini_messages below — the ordering implicit caching needs.
+            # However the ordering alone isn't sufficient: implicit caching also requires
+            # system_instruction to clear a per-model minimum token count (2,048 for both
+            # gemini-2.5-flash and gemini-2.5-pro as of mid-2026). Several of this
+            # library's system prompts (e.g. extract_edges.edge, ~1.7K tokens including
+            # its response schema) currently fall short of that bar, so caching won't
+            # actually trigger for them without the same kind of padding
+            # extract_json got for Anthropic's 1,024-token minimum (see commit 8242a2d).
             generation_config = types.GenerateContentConfig(
                 temperature=self.temperature,
                 max_output_tokens=resolved_max_tokens,
