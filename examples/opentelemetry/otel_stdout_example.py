@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 def setup_otel_stdout_tracing():
     """Configure OpenTelemetry to export traces to stdout."""
+    # Instead of shipping spans to a real backend (Jaeger, Datadog, etc.), this
+    # wires up a "console exporter" so every span Graphiti records gets printed
+    # straight to the terminal, letting you watch its internal steps as they happen.
     resource = Resource(attributes={'service.name': 'graphiti-example'})
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
@@ -47,19 +50,27 @@ def setup_otel_stdout_tracing():
 
 
 async def main():
+    # Turn on the "instrument panel" described above.
     otel_tracer = setup_otel_stdout_tracing()
 
     print('OpenTelemetry stdout tracing enabled\n')
 
+    # Kuzu is an embedded graph database, so no external DB server is required
+    # to run this example. Passing `tracer` here is what makes Graphiti print
+    # its internal steps for every call below.
     kuzu_driver = KuzuDriver()
     graphiti = Graphiti(
         graph_driver=kuzu_driver, tracer=otel_tracer, trace_span_prefix='graphiti.example'
     )
 
     try:
+        # One-time setup of the indices/constraints the graph needs.
         await graphiti.build_indices_and_constraints()
         print('Graph indices and constraints built\n')
 
+        # The raw facts we're going to teach Graphiti about: two sentences of
+        # biographical text about Kamala Harris, and one structured (JSON)
+        # record about Gavin Newsom.
         episodes = [
             {
                 'content': 'Kamala Harris is the Attorney General of California. She was previously '
@@ -86,6 +97,11 @@ async def main():
 
         print('Adding episodes...\n')
         for i, episode in enumerate(episodes):
+            # Each add_episode call is where the real work happens: Graphiti
+            # reads the content, identifies entities and relationships, and
+            # merges them into the knowledge graph. Because a tracer was
+            # passed above, every internal step of that process (including
+            # any LLM calls it makes) gets printed to the console as it runs.
             await graphiti.add_episode(
                 name=f'Episode {i}',
                 episode_body=episode['content']
@@ -97,6 +113,8 @@ async def main():
             )
             print(f'Added episode: Episode {i} ({episode["type"].value})')
 
+        # Now query the graph instead of the raw text — Graphiti searches the
+        # facts and relationships it built up above to answer this question.
         print("\nSearching for: 'Who was the California Attorney General?'\n")
         results = await graphiti.search('Who was the California Attorney General?')
 
@@ -107,6 +125,7 @@ async def main():
             if hasattr(result, 'valid_at') and result.valid_at:
                 print(f'  Valid from: {result.valid_at}')
 
+        # A second question, this time about the JSON episode we added.
         print("\nSearching for: 'What positions has Gavin Newsom held?'\n")
         results = await graphiti.search('What positions has Gavin Newsom held?')
 
@@ -118,6 +137,7 @@ async def main():
         print('\nExample complete')
 
     finally:
+        # Always release the Kuzu connection, even if something above failed.
         await graphiti.close()
 
 

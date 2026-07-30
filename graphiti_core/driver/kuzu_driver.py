@@ -250,10 +250,10 @@ class KuzuDriver(GraphDriver):
         pass
 
     async def build_indices_and_constraints(self, delete_existing: bool = False):
-        # Kuzu doesn't support dynamic index creation like Neo4j or FalkorDB
-        # Schema and indices are created during setup_schema()
-        # This method is required by the abstract base class but is a no-op for Kuzu
-        pass
+        # Table schema is static (created in setup_schema()); this builds the
+        # full-text indices (e.g. edge_name_and_fact) that edge/node/episode
+        # search rely on.
+        await self._graph_ops.build_indices_and_constraints(self, delete_existing)
 
     def setup_schema(self):
         conn = kuzu.Connection(self.db)

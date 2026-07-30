@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -147,13 +148,24 @@ class OpenTelemetryTracer(Tracer):
     @contextmanager
     def start_span(self, name: str) -> Generator[OpenTelemetrySpan | NoOpSpan, None, None]:
         """Start a new OpenTelemetry span with the configured prefix."""
+        full_name = f'{self._span_prefix}.{name}'
         try:
-            full_name = f'{self._span_prefix}.{name}'
-            with self._tracer.start_as_current_span(full_name) as span:
-                yield OpenTelemetrySpan(span)
+            span_cm = self._tracer.start_as_current_span(full_name)
+            span = span_cm.__enter__()
         except Exception:
-            # If tracing fails, yield a no-op span to prevent breaking the operation
+            # If starting the span fails, yield a no-op span to prevent breaking the operation
             yield NoOpSpan()
+            return
+
+        # From here on, exceptions belong to the wrapped code, not to tracing setup —
+        # let them propagate instead of swallowing them at this yield.
+        try:
+            yield OpenTelemetrySpan(span)
+        except BaseException:
+            span_cm.__exit__(*sys.exc_info())
+            raise
+        else:
+            span_cm.__exit__(None, None, None)
 
 
 def create_tracer(otel_tracer: Any | None = None, span_prefix: str = 'graphiti') -> Tracer:
