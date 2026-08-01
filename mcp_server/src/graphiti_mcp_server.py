@@ -1237,6 +1237,17 @@ async def initialize_server() -> ServerConfig:
     if config.server.port:
         mcp.settings.port = config.server.port
 
+    # FastMCP's DNS-rebinding protection is decided from the constructor's default
+    # host ("127.0.0.1") before config.server.host is applied above, so it always
+    # locks the allowed Host header to localhost regardless of the actual bind
+    # address. Extend it for hosts fronting this server (e.g. a dev tunnel).
+    extra_hosts = [h.strip() for h in os.environ.get('MCP_ALLOWED_HOSTS', '').split(',') if h.strip()]
+    if extra_hosts and mcp.settings.transport_security:
+        mcp.settings.transport_security.allowed_hosts.extend(extra_hosts)
+        mcp.settings.transport_security.allowed_origins.extend(
+            f'{scheme}://{h}' for h in extra_hosts for scheme in ('https', 'http')
+        )
+
     # Return MCP configuration for transport
     return config.server
 
